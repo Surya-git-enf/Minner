@@ -1,5 +1,8 @@
+web3==6.0.0
 fastapi
-uvicorn
-web3
+uvicorn[standard]
 python-dotenv
-
+requests
+websockets
+sqlalchemy
+python-multipart
