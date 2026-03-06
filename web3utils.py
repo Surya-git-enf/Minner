@@ -2,7 +2,6 @@
 import os, time
 from dotenv import load_dotenv
 from web3 import Web3
-from eth_account import Account
 
 load_dotenv()
 
@@ -19,7 +18,13 @@ def check_connection():
     if not w3_http.is_connected():
         raise RuntimeError("HTTP RPC not connected")
     if w3_wss and not w3_wss.is_connected():
-        print("Warning: WSS not connected; pair listener may not run")
+        print("Warning: WSS not connected; listener may be degraded")
+
+def to_wei_matic(amount_decimal):
+    return int(float(amount_decimal) * 10**18)
+
+def from_wei_matic(value):
+    return float(value) / 10**18
 
 def build_tx(tx):
     tx.setdefault("chainId", CHAIN_ID)
@@ -38,9 +43,3 @@ def sign_and_send(tx):
     signed = w3_http.eth.account.sign_transaction(tx, PRIVATE_KEY)
     txhash = w3_http.eth.send_raw_transaction(signed.rawTransaction)
     return txhash.hex()
-
-def to_wei(amount_decimal):
-    return int(amount_decimal * 10**18)
-
-def from_wei(value):
-    return value / 10**18
