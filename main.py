@@ -1,6 +1,6 @@
 # main.py
 from fastapi import FastAPI
-import threading, time
+import threading
 from listener import listen_pair_created
 from sniper import handle_pair
 from db import init_db
@@ -10,7 +10,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"status":"sniper god running"}
+    return {"status": "sniper_god_running"}
 
 def start_listener():
     check_connection()
