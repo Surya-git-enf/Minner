@@ -6,6 +6,4 @@ requests
 websockets
 sqlalchemy
 pkg_resources
-web3==6.0.0
-websockets
 eth-abi
