@@ -1,10 +1,8 @@
-web3
-websockets
-python-dotenv
 fastapi
-uvicorn
+uvicorn[standard]
+web3
+python-dotenv
 requests
+websockets
 sqlalchemy
 eth-abi
-pkg_resources
-
