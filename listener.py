@@ -1,44 +1,51 @@
 # listener.py
-import os, time
-from dotenv import load_dotenv
-from web3utils import w3_wss, w3_http, check_connection
-from web3 import Web3
+import time, threading
+from web3utils import w3, w3_ws, ensure_connected
+from config import ROUTER_ADDRESSES, MIN_WHALE_MATIC, CHECK_INTERVAL_SECONDS
+from decoder import decode_swap_input
 from telegram_alerts import send
-from db import is_sniped, mark_sniped
+from db import record_event
 
-load_dotenv()
-FACTORY_ADDRESS = Web3.to_checksum_address(os.getenv("FACTORY_ADDRESS"))
-PAIR_CREATED_SIG = Web3.keccak(text="PairCreated(address,address,address,uint256)").hex()
+def handle_tx(tx_hash, tx):
+    # tx is dict returned by w3.eth.get_transaction
+    # detect if from known whale address or value >= threshold
+    value_matic = float(tx.get("value",0)) / 10**18
+    from_addr = tx.get("from")
+    # simple threshold: large native value OR looking for swap calls to known router addresses
+    to_addr = tx.get("to")
+    if to_addr and to_addr.lower() in [r.lower() for r in ROUTER_ADDRESSES] or value_matic >= MIN_WHALE_MATIC:
+        # decode input
+        info = decode_swap_input(tx.get("input",""))
+        msg = f"Whale tx detected\nfrom: {from_addr}\nto: {to_addr}\nvalue(matic): {value_matic}\nfn: {info.get('type')}"
+        send(msg + f"\nhttps://mumbai.polygonscan.com/tx/{tx_hash}")
+        record_event({"tx":tx_hash,"from":from_addr,"value_matic":value_matic,"type":info.get("type")})
+        # publish to copier or monitor (main app will handle further)
+    # else ignore
 
-def listen_pair_created(callback):
-    # Poll logs if websocket isn't available
-    if not w3_wss or not w3_wss.is_connected():
-        print("WSS not connected — falling back to HTTP polling for new pairs.")
-    print("Starting PairCreated listener...")
-    from_block = w3_http.eth.block_number
-    while True:
+def pending_listener():
+    # low-latency: subscribe to pending txs (requires websocket provider)
+    if not w3_ws:
+        print("WSS not configured, pending listener disabled")
+        return
+    sub = w3_ws.eth.subscribe("newPendingTransactions")
+    print("Subscribed to pending txs")
+    for tx_hash in sub:
         try:
-            latest = w3_http.eth.block_number
-            logs = w3_http.eth.get_logs({
-                "fromBlock": from_block,
-                "toBlock": latest,
-                "address": FACTORY_ADDRESS,
-                "topics": [PAIR_CREATED_SIG]
-            })
-            for l in logs:
-                topics = l["topics"]
-                # tokens encoded in topics[1] and topics[2]
-                token0 = Web3.to_checksum_address("0x"+topics[1].hex()[-40:])
-                token1 = Web3.to_checksum_address("0x"+topics[2].hex()[-40:])
-                # read pair from data (last 32 bytes)
-                pair = Web3.to_checksum_address("0x"+l["data"][-64:])
-                if is_sniped(pair):
-                    continue
-                print("New pair:", pair, token0, token1)
-                send(f"New pair detected: {pair}\n{token0} / {token1}")
-                callback(pair, token0, token1)
-                mark_sniped(pair, token0, token1)
-            from_block = latest + 1
-        except Exception as e:
-            print("Listener error:", e)
-            time.sleep(2)
+            tx = w3.eth.get_transaction(tx_hash)
+            handle_tx(tx_hash, tx)
+        except Exception:
+            continue
+
+def block_polling_listener(callback_on_tx):
+    # fallback: poll recent blocks and scan transactions
+    last_block = w3.eth.block_number
+    while True:
+        latest = w3.eth.block_number
+        if latest > last_block:
+            for b in range(last_block+1, latest+1):
+                blk = w3.eth.get_block(b, full_transactions=True)
+                for tx in blk.transactions:
+                    # simple check
+                    callback_on_tx(tx.hash.hex(), tx)
+            last_block = latest
+        time.sleep(CHECK_INTERVAL_SECONDS)
