@@ -105,7 +105,7 @@ def perform_arbitrage_scan():
                 
         elif sushi_out > quick_out:
             profit = ((sushi_out - quick_out) / quick_out) * 100
-            if profit >= 0.5:
+            if profit >= 0.01:
                 send_alert(f"🎯 <b>OPPORTUNITY DETECTED!</b>\nSpread: {profit:.2f}%\nSushiSwap is higher.")
                 execute_trade(sushi_contract, "SushiSwap", trade_amount_wei, sushi_out, path)
             else:
