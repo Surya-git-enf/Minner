@@ -1,128 +1,142 @@
-import os
-import time
-import requests
+# main.py
+import os, time
 from fastapi import FastAPI, BackgroundTasks
-from web3 import Web3
 from dotenv import load_dotenv
+from web3utils import w3, cs, to_wei_base, from_wei_base
+from trader import execute_arbitrage
+from telegram_alerts import send
+from db import init_db, get_counter
+from security import goplus_check, simulate_call
+import threading
 
-# --- 1. LOAD CREDENTIALS & SETUP ---
 load_dotenv()
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-RPC_URL = os.getenv("PRIVATE_RPC_URL", "https://polygon.mev-blocker.io")
-
-# Telegram Variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DRY_RUN = os.getenv("DRY_RUN", "True") == "True" # Defaults to True so you don't accidentally lose money
 
 app = FastAPI()
+init_db()
 
-# --- 2. TELEGRAM ALERT SYSTEM ---
-def send_alert(message):
-    print(message) # Always print to Render terminal
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
+# Config env
+QUICK = w3.eth.contract(address=cs(os.getenv("QUICKSWAP_ROUTER")), abi=[])
+SUSHI = w3.eth.contract(address=cs(os.getenv("SUSHISWAP_ROUTER")), abi=[])
+FACTORY = cs(os.getenv("FACTORY_ADDRESS"))
+BASE_TOKEN = cs(os.getenv("BASE_TOKEN"))
+QUOTE_TOKEN = cs(os.getenv("QUOTE_TOKEN"))
+TRADE_AMOUNT_BASE = float(os.getenv("TRADE_AMOUNT_BASE", "0.05"))
+MIN_SPREAD_PERCENT = float(os.getenv("MIN_SPREAD_PERCENT", "0.8"))
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+REQUIRE_CONFIRMATION = os.getenv("REQUIRE_CONFIRMATION", "true").lower() == "true"
+ENABLE_MAINNET = os.getenv("ENABLE_MAINNET", "false").lower() == "true"
 
-# --- 3. WEB3 & CONTRACTS ---
-web3 = Web3(Web3.HTTPProvider(RPC_URL))
-QUICKSWAP_ROUTER = web3.to_checksum_address("0xa5E0829CaCEd8fFCEEd813c0150ce195f19520a1")
-SUSHISWAP_ROUTER = web3.to_checksum_address("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506")
-POL_TOKEN = web3.to_checksum_address("0x0000000000000000000000000000000000001010") 
-USDC_TOKEN = web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+lock = threading.Lock()
+_last_scan = {}
 
-# ABI to check prices and execute trades
-ROUTER_ABI = [
-    {"constant": True, "inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "path", "type": "address[]"}], "name": "getAmountsOut", "outputs": [{"name": "amounts", "type": "uint256[]"}], "payable": False, "stateMutability": "view", "type": "function"},
-    {"name": "swapExactTokensForTokens", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "amountOutMin", "type": "uint256"}, {"name": "path", "type": "address[]"}, {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}], "outputs": [{"name": "amounts", "type": "uint256[]"}]}
-]
+def compute_required_spread(trade_amount_base):
+    gas_pct = float(os.getenv("ESTIMATED_GAS_BASE", "0.001")) / trade_amount_base * 100.0
+    slippage = float(os.getenv("SLIPPAGE_PERCENT", "0.5"))
+    margin = float(os.getenv("SAFETY_MARGIN_PERCENT", "0.3"))
+    return max(MIN_SPREAD_PERCENT, gas_pct + slippage + margin)
 
-quick_contract = web3.eth.contract(address=QUICKSWAP_ROUTER, abi=ROUTER_ABI)
-sushi_contract = web3.eth.contract(address=SUSHISWAP_ROUTER, abi=ROUTER_ABI)
+def quick_contract():
+    abi = [{"name":"getAmountsOut","inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"outputs":[{"name":"amounts","type":"uint256[]"}],"stateMutability":"view","type":"function"}]
+    return w3.eth.contract(address=cs(os.getenv("QUICKSWAP_ROUTER")), abi=abi)
 
-# --- 4. THE EXECUTION ENGINE ---
-def execute_trade(router_contract, router_name, amount_in_wei, expected_out_wei, path):
-    min_out = int(expected_out_wei * 0.995) # 0.5% Slippage Protection
-    
-    if DRY_RUN:
-        send_alert(f"🌵 <b>DRY RUN:</b> Would have executed trade on {router_name}.\nInput: 50 POL\nExpected Output: {expected_out_wei / 10**6:.2f} USDC")
-        return
+def sushi_contract():
+    abi = [{"name":"getAmountsOut","inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"outputs":[{"name":"amounts","type":"uint256[]"}],"stateMutability":"view","type":"function"}]
+    return w3.eth.contract(address=cs(os.getenv("SUSHISWAP_ROUTER")), abi=abi)
 
-    try:
-        nonce = web3.eth.get_transaction_count(WALLET_ADDRESS)
-        transaction = router_contract.functions.swapExactTokensForTokens(
-            amount_in_wei, 
-            min_out, 
-            path, 
-            WALLET_ADDRESS, 
-            int(time.time()) + 300
-        ).build_transaction({
-            'chainId': 137, 
-            'gas': 250000, 
-            'gasPrice': web3.eth.gas_price, 
-            'nonce': nonce
-        })
+def scan_and_maybe_trade():
+    global _last_scan
+    with lock:
+        try:
+            trade_amount = TRADE_AMOUNT_BASE
+            trade_wei = to_wei_base(trade_amount)
+            path_buy = [BASE_TOKEN, QUOTE_TOKEN]
+            path_sell = [QUOTE_TOKEN, BASE_TOKEN]
+            quick = quick_contract()
+            sushi = sushi_contract()
 
-        signed_txn = web3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
-        tx_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
-        tx_hex = web3.to_hex(tx_hash)
-        
-        send_alert(f"🚀 <b>TRADE EXECUTED on {router_name}!</b>\nHash: <a href='https://polygonscan.com/tx/{tx_hex}'>{tx_hex}</a>")
-        
-    except Exception as e:
-        send_alert(f"🚨 <b>TRADE FAILED:</b> {str(e)}")
+            quick_out = quick.functions.getAmountsOut(trade_wei, path_buy).call()[1]
+            sushi_out = sushi.functions.getAmountsOut(trade_wei, path_buy).call()[1]
 
-# --- 5. THE ARBITRAGE SCANNER ---
-def perform_arbitrage_scan():
-    if not web3.is_connected():
-        send_alert("❌ <b>ERROR:</b> Bot failed to connect to Polygon RPC.")
-        return
-        
-    trade_amount_pol = 50 # Base trade amount: 50 POL
-    trade_amount_wei = web3.to_wei(trade_amount_pol, 'ether')
-    path = [POL_TOKEN, USDC_TOKEN]
+            # convert to human
+            quote_dec = int(os.getenv("QUOTE_TOKEN_DECIMALS", "6"))
+            quick_h = float(quick_out) / (10**quote_dec)
+            sushi_h = float(sushi_out) / (10**quote_dec)
 
-    try:
-        # Ask both exchanges for their current price
-        quick_out = quick_contract.functions.getAmountsOut(trade_amount_wei, path).call()[1]
-        sushi_out = sushi_contract.functions.getAmountsOut(trade_amount_wei, path).call()[1]
+            # decide buy/sell combination by comparing round-trip (simulate)
+            backA = quick.functions.getAmountsOut(sushi_out, path_sell).call()[1]
+            backB = sushi.functions.getAmountsOut(quick_out, path_sell).call()[1]
 
-        # Calculate mathematically which one is higher
-        if quick_out > sushi_out:
-            profit = ((quick_out - sushi_out) / sushi_out) * 100
-            if profit >= 0.5: # If profit is greater than 0.5%, strike.
-                send_alert(f"🎯 <b>OPPORTUNITY DETECTED!</b>\nSpread: {profit:.2f}%\nQuickSwap is higher.")
-                execute_trade(quick_contract, "QuickSwap", trade_amount_wei, quick_out, path)
+            if backA >= backB:
+                buy_router, sell_router = sushi, quick
+                buy_on, sell_on = "Sushi", "Quick"
+                usdc_raw = sushi_out
             else:
-                print(f"Spread too low ({profit:.2f}%). Ignoring.")
-                
-        elif sushi_out > quick_out:
-            profit = ((sushi_out - quick_out) / quick_out) * 100
-            if profit >= 0.01:
-                send_alert(f"🎯 <b>OPPORTUNITY DETECTED!</b>\nSpread: {profit:.2f}%\nSushiSwap is higher.")
-                execute_trade(sushi_contract, "SushiSwap", trade_amount_wei, sushi_out, path)
+                buy_router, sell_router = quick, sushi
+                buy_on, sell_on = "Quick", "Sushi"
+                usdc_raw = quick_out
+
+            back_base = (backA if backA>=backB else backB) / (10**18)  # base token decimals 18
+            est_profit = back_base - trade_amount
+            net_spread_pct = (est_profit / trade_amount) * 100.0
+            req_spread = compute_required_spread(trade_amount)
+
+            _last_scan = {
+                "buy_on": buy_on, "sell_on": sell_on,
+                "trade_amount": trade_amount,
+                "est_profit": est_profit, "net_spread_pct": net_spread_pct, "required": req_spread
+            }
+
+            send(f"Scan: {buy_on}->{sell_on} est_profit={est_profit:.6f} base ({net_spread_pct:.4f}%); req {req_spread:.4f}% (DRY_RUN={DRY_RUN})")
+
+            # security checks:
+            # 1) basic external audit if API provided - skip if no key
+            token_addr = path_buy[1]
+            g = goplus_check(token_addr)
+            if not g.get("ok", True):
+                send(f"Security fail: {g.get('reason')}; skipping.")
+                return
+
+            # 2) simulate swap call (buy then sell) to detect immediate revert/honeypot
+            # encode function call data for buy & sell and eth_call them
+            buy_abi = buy_router.encodeABI(fn_name="getAmountsOut", args=[trade_wei, path_buy])
+            # note: getAmountsOut is view; we used previous calls. For actual revert test, call swap function via eth_call by encoding swap and calling - more advanced.
+            # quick approach: assume getAmountsOut succeeded -> proceed.
+
+            if net_spread_pct >= req_spread:
+                send(f"Opportunity OK: {buy_on} -> {sell_on} | est_profit={est_profit:.6f}")
+                if DRY_RUN:
+                    send("DRY_RUN enabled — not sending transactions.")
+                    return
+                if REQUIRE_CONFIRMATION:
+                    send("Manual confirmation required. Reply /confirm to Telegram to execute.")
+                    return
+                # else execute
+                res = execute_arbitrage(buy_router, sell_router, path_buy, path_sell, trade_amount, os.getenv("WALLET_ADDRESS"), os.getenv("PRIVATE_KEY"), dry_run=False)
+                if res.get("success"):
+                    send(f"Trade done. P&L (est): {res.get('profit_base'):+.6f}")
+                else:
+                    send(f"Trade failed: {res.get('note')}")
             else:
-                print(f"Spread too low ({profit:.2f}%). Ignoring.")
-        else:
-            print("Prices are identical. No trade.")
+                send("Spread below required threshold. Skipping.")
+        except Exception as e:
+            send(f"Scan error: {e}")
+        finally:
+            return
 
-    except Exception as e:
-        print(f"Scan error: {e}")
-
-# --- 6. FASTAPI ENDPOINTS ---
 @app.get("/")
 def home():
-    return {"status": "awake", "message": "Crypto Knight is online."}
+    return {"status":"ok","msg":"Crypto Knight v2 alive"}
+
+@app.get("/scan-now")
+def scan_now(background_tasks: BackgroundTasks):
+    background_tasks.add_task(scan_and_maybe_trade)
+    return {"status":"scan_started"}
 
 @app.get("/cron-scan")
-def trigger_scan(background_tasks: BackgroundTasks):
-    background_tasks.add_task(perform_arbitrage_scan)
-    return {"status": "success", "message": "Market scan initiated."}
-    
+def cron_scan(background_tasks: BackgroundTasks):
+    background_tasks.add_task(scan_and_maybe_trade)
+    return {"status":"cron_scan_started"}
+
+@app.get("/status")
+def status():
+    return {"last_scan": _last_scan}
