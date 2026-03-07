@@ -1,8 +1,6 @@
 fastapi
-uvicorn[standard]
-web3
+uvicorn
+web3==6.11.1
 python-dotenv
 requests
 sqlalchemy
-eth-abi
-web3.middleware.geth_poa==26.0.1
