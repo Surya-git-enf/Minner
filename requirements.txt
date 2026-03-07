@@ -1,7 +1,7 @@
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-web3==6.0.0
-python-dotenv==1.0.0
-requests==2.31.0
-sqlalchemy==2.0.22
-eth-abi==5.2.0
+fastapi
+uvicorn[standard]
+web3
+python-dotenv
+requests
+sqlalchemy
+eth-abi
