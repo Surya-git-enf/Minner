@@ -6,3 +6,4 @@ requests
 websockets
 sqlalchemy
 eth-abi
+web3.middleware.geth_poa
