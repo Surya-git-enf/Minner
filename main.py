@@ -2,7 +2,7 @@
 import os, time
 from fastapi import FastAPI, BackgroundTasks
 from dotenv import load_dotenv
-from web3utils import w3, cs, to_wei_base, from_wei_base
+from web3.middleware.geth_poa import geth_poa_middleware
 from trader import execute_arbitrage
 from telegram_alerts import send
 from db import init_db, get_counter
