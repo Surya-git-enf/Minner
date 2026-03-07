@@ -121,7 +121,7 @@ def scan_and_maybe_trade():
         except Exception as e:
             send(f"Scan error: {e}")
         finally:
-            return
+            pass
 
 @app.get("/")
 def home():
