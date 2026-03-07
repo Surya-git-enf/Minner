@@ -5,4 +5,4 @@ python-dotenv
 requests
 sqlalchemy
 eth-abi
-web3.middleware.geth_poa
+web3.middleware.geth_poa==26.0.1
